@@ -5,5 +5,6 @@ from .bitbucket import Bitbucket as Stash
 from .portfolio import Portfolio
 from .bamboo import Bamboo
 from .crowd import Crowd
+from .wordpress import Wordpress
 
-__all__ = ['Confluence', 'Jira', 'Bitbucket', 'Portfolio', 'Bamboo', 'Stash', 'Crowd']
+__all__ = ['Confluence', 'Jira', 'Bitbucket', 'Portfolio', 'Bamboo', 'Stash', 'Crowd', 'Wordpress']
