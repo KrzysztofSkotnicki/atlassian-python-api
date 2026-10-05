@@ -20,6 +20,7 @@ CONFLUENCE_TOKEN = 'PASTE-YOUR-TOKEN-HERE'
 SPACE_KEY = 'DOCS'
 OUTPUT_DIR = './confluence-export'
 VERIFY_SSL = True
+DIRECT_CONNECTION = True
 
 import ast
 import json
@@ -28,6 +29,7 @@ import platform
 import socket
 import ssl
 import sys
+import tempfile
 import time
 import traceback
 
@@ -83,7 +85,8 @@ def mask(token):
 
 def read_config():
     cfg = {'CONFLUENCE_URL': CONFLUENCE_URL, 'CONFLUENCE_TOKEN': CONFLUENCE_TOKEN,
-           'SPACE_KEY': SPACE_KEY, 'OUTPUT_DIR': OUTPUT_DIR, 'VERIFY_SSL': VERIFY_SSL}
+           'SPACE_KEY': SPACE_KEY, 'OUTPUT_DIR': OUTPUT_DIR, 'VERIFY_SSL': VERIFY_SSL,
+           'DIRECT_CONNECTION': DIRECT_CONNECTION}
     if not os.path.exists(MAIN_SCRIPT):
         return cfg, 'this file (main script not found next to it)'
     with open(MAIN_SCRIPT, encoding='utf-8-sig') as f:
@@ -101,6 +104,53 @@ def read_config():
     return cfg, MAIN_SCRIPT
 
 
+def system_ca_bundle():
+    """
+    'requests' trusts only its own CA list (certifi), not the Windows certificate store,
+    so company CAs (e.g. an internal "Issuing CA") are rejected. Build a PEM bundle with
+    certifi + trusted Windows ROOT/CA certificates and return its path (None if not Windows).
+    """
+    if not hasattr(ssl, 'enum_certificates'):  # only exists on Windows
+        return None, 0
+    pems, count = [], 0
+    try:
+        import certifi
+        with open(certifi.where(), encoding='utf-8') as f:
+            pems.append(f.read())
+    except (ImportError, OSError):
+        pass
+    for store in ('ROOT', 'CA'):
+        try:
+            certificates = ssl.enum_certificates(store)
+        except OSError:
+            continue
+        for der, encoding, trust in certificates:
+            # trust is True (all purposes) or a set of OIDs; 1.3.6.1.5.5.7.3.1 = server authentication
+            if encoding == 'x509_asn' and (trust is True or '1.3.6.1.5.5.7.3.1' in trust):
+                pems.append(ssl.DER_cert_to_PEM_cert(der))
+                count += 1
+    path = os.path.join(tempfile.gettempdir(), 'confluence-ca-bundle.pem')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(pems))
+    return path, count
+
+
+def resolve_verify(setting):
+    """VERIFY_SSL: True -> Windows store + certifi (on Windows), path -> that file, False -> no check."""
+    if setting is True:
+        path, _ = system_ca_bundle()
+        return path or True
+    return setting
+
+
+def bypass_proxy(url):
+    """Connect to Confluence directly, ignoring the system/company proxy, for this host only."""
+    host = urlparse(url).hostname
+    for key in ('NO_PROXY', 'no_proxy'):
+        current = os.environ.get(key, '')
+        os.environ[key] = ','.join(x for x in (current, host) if x)
+
+
 class Http:
     """Same requests as the main script; uses 'requests' if installed, else urllib."""
 
@@ -112,7 +162,6 @@ class Http:
             import requests
             self.requests = requests
             self.session = requests.Session()
-            self.session.verify = verify
         except ImportError:
             self.requests = None
 
@@ -125,7 +174,8 @@ class Http:
             headers['Authorization'] = 'Bearer ' + self.token
         started = time.time()
         if self.requests:
-            r = self.session.get(url, headers=headers, timeout=TIMEOUT, stream=True, allow_redirects=False)
+            r = self.session.get(url, headers=headers, timeout=TIMEOUT, stream=True, allow_redirects=False,
+                                 verify=self.verify)
             body = r.raw.read(max_bytes) if max_bytes else r.content
             status, hdrs = r.status_code, r.headers
             r.close()
@@ -187,6 +237,7 @@ def main():
     out('Space key:  %r' % space_key)
     out('Output dir: %r -> %s' % (cfg['OUTPUT_DIR'], os.path.abspath(cfg['OUTPUT_DIR'])))
     out('VERIFY_SSL: %r' % (cfg['VERIFY_SSL'],))
+    out('DIRECT_CONNECTION: %r' % (cfg['DIRECT_CONNECTION'],))
     problems = []
     if 'example.com' in url:
         problems.append('CONFLUENCE_URL still has the example value')
@@ -220,6 +271,15 @@ def main():
         for key in (name, name.lower()):
             if os.environ.get(key):
                 out('       env %s=%s' % (key, os.environ[key]))
+    if cfg['DIRECT_CONNECTION']:
+        bypass_proxy(url)
+        out('       DIRECT_CONNECTION=True -> proxy bypassed for %s' % host)
+    try:
+        import requests
+        used = requests.utils.get_environ_proxies(url)
+        out('       proxy that requests will use for Confluence: %s' % (used.get(parsed.scheme) or 'none (direct)'))
+    except ImportError:
+        pass
     ok('proxy', 'proxy info collected')
 
     # 4 -----------------------------------------------------------------
@@ -262,8 +322,29 @@ def main():
     else:
         warn('ssl-system', 'plain http:// - no TLS')
 
-    http = Http(url, token, cfg['VERIFY_SSL'])
+    verify = resolve_verify(cfg['VERIFY_SSL'])
+    if parsed.scheme == 'https':
+        step('6b. requests: certifi only vs. Windows certificate store')
+        bundle, count = system_ca_bundle()
+        out('       Windows store: %s' % ('%d trusted certificates -> %s' % (count, bundle) if bundle else 'not available (not Windows)'))
+        try:
+            import requests
+            variants = [('certifi only', True)] + ([('certifi + Windows store', bundle)] if bundle else [])
+            for label, value in variants:
+                try:
+                    requests.get(url.rstrip('/') + '/status', verify=value, timeout=TIMEOUT)
+                    out('       %-24s -> OK' % label)
+                except requests.exceptions.SSLError as e:
+                    out('       %-24s -> SSL ERROR: %s' % (label, str(e)[:200]))
+                except requests.RequestException as e:
+                    out('       %-24s -> %s: %s' % (label, type(e).__name__, str(e)[:200]))
+        except ImportError:
+            pass
+        ok('ssl-compare', 'comparison done')
+
+    http = Http(url, token, verify)
     out('HTTP library used for next steps: %s' % ('requests' if http.requests else 'urllib (requests missing)'))
+    out('TLS verification used: %s' % (verify,))
 
     # 7 -----------------------------------------------------------------
     step('7. Confluence reachable (/status, no login)')
@@ -279,7 +360,7 @@ def main():
     except Exception as e:
         if 'SSL' in type(e).__name__ or 'CERTIFICATE' in str(e).upper():
             fail('status', 'SSL error: %s\n'
-                 '       -> company certificate not trusted by Python. Set VERIFY_SSL to the path of your company CA file (.pem/.crt).' % e)
+                 '       -> company certificate not trusted. Export the company root + issuing CA (Base-64 .cer) and set VERIFY_SSL to that file path.' % e)
         else:
             fail('status', '%s: %s' % (type(e).__name__, e))
         return
