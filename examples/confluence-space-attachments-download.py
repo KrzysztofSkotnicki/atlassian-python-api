@@ -41,6 +41,9 @@ SKIP_EXISTING = True
 # TLS: True = standard verification, or path to an internal CA bundle, e.g. 'C:/certs/company-ca.pem'
 VERIFY_SSL = True
 
+# Wait for Enter before closing, so the window stays open when started by double-click
+PAUSE_AT_END = True
+
 # =============================================================================
 
 import argparse
@@ -51,7 +54,14 @@ import re
 import sys
 import time
 
-import requests
+try:
+    import requests
+except ImportError:
+    print('ERROR: the "requests" library is missing. Install it with:')
+    print('    "%s" -m pip install requests' % sys.executable)
+    if PAUSE_AT_END:
+        input('\nPress Enter to close...')
+    sys.exit(1)
 
 PAGE_LIMIT = 100
 INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -293,9 +303,29 @@ def main():
     return 1 if stats['errors'] else 0
 
 
+def pause():
+    if PAUSE_AT_END:
+        try:
+            input('\nPress Enter to close...')
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+
 if __name__ == '__main__':
+    print('Starting Confluence attachments download...')
+    exit_code = 1
     try:
-        sys.exit(main())
+        exit_code = main()
     except KeyboardInterrupt:
         print('\nInterrupted - run again to resume (already downloaded files will be skipped).')
-        sys.exit(130)
+        exit_code = 130
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            print(e.code if isinstance(e.code, str) else 'Exit code %s' % e.code)
+        exit_code = e.code if isinstance(e.code, int) else 1
+    except Exception:
+        import traceback
+        print('\nUNEXPECTED ERROR - run confluence-diagnostics.py and send its log:')
+        traceback.print_exc(file=sys.stdout)
+    pause()
+    sys.exit(exit_code)
