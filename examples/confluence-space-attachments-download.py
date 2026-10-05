@@ -3,25 +3,49 @@
 Download all attachments from a Confluence Data Center / Server space,
 saving them into folders that mirror the page tree of the space.
 
-    <out>/<SPACE>/<Root page>/<Child page>/<Grandchild page>/file.pdf
+    <OUTPUT_DIR>/<SPACE>/<Root page>/<Child page>/<Grandchild page>/file.pdf
+
+HOW TO USE
+  1. Fill in the CONFIGURATION section below (URL, token, space key).
+  2. Run:  python3 confluence-space-attachments-download.py
+     Progress is printed to the console and saved to _download.log.
 
 Uses only the public REST API (/rest/api/content), so Confluence enforces
-permissions: the account sees only what it is allowed to view in the space.
-
-Authentication (pick one):
-  * Personal Access Token (recommended, Confluence DC 7.9+):
-        export CONFLUENCE_TOKEN=...
-  * Username + password:
-        export CONFLUENCE_USER=jdoe CONFLUENCE_PASSWORD=...
-
-Example:
-    python3 confluence-space-attachments-download.py \
-        --url https://confluence.example.com --space DOCS --out ./export
+permissions: the token owner sees only what they are allowed to view.
 
 Requires: requests (pip install requests)
 """
+
+# =============================================================================
+# CONFIGURATION - fill in before running
+# =============================================================================
+
+# Confluence base URL incl. context path, e.g. https://wiki.example.com/confluence
+CONFLUENCE_URL = 'https://confluence.example.com'
+
+# Personal Access Token: Avatar (top right) -> Profile -> Personal Access Tokens -> Create token
+CONFLUENCE_TOKEN = 'PASTE-YOUR-TOKEN-HERE'
+
+# Space key (visible in the URL: .../display/KEY/... or in Space tools -> Overview)
+SPACE_KEY = 'DOCS'
+
+# Where to save files (a <SPACE_KEY> subfolder is created inside)
+OUTPUT_DIR = './confluence-export'
+
+# Also download attachments of blog posts (saved under "_Blog posts")
+INCLUDE_BLOGPOSTS = False
+
+# Skip files that already exist with the same size (lets you resume an interrupted run)
+SKIP_EXISTING = True
+
+# TLS: True = standard verification, or path to an internal CA bundle, e.g. 'C:/certs/company-ca.pem'
+VERIFY_SSL = True
+
+# =============================================================================
+
 import argparse
 import csv
+import logging
 import os
 import re
 import sys
@@ -32,6 +56,8 @@ import requests
 PAGE_LIMIT = 100
 INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 RESERVED_NAMES = {'CON', 'PRN', 'AUX', 'NUL'} | {'COM%d' % i for i in range(1, 10)} | {'LPT%d' % i for i in range(1, 10)}
+
+log = logging.getLogger('confluence-download')
 
 
 def safe_name(name, max_len=120):
@@ -47,19 +73,21 @@ def safe_name(name, max_len=120):
     return name
 
 
+def human_size(num):
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if num < 1024 or unit == 'GB':
+            return ('%d %s' if unit == 'B' else '%.1f %s') % (num, unit)
+        num /= 1024.0
+
+
 class Confluence:
-    def __init__(self, url, token=None, user=None, password=None, verify=True, timeout=120):
+    def __init__(self, url, token, verify=True, timeout=120):
         self.url = url.rstrip('/')
         self.session = requests.Session()
         self.session.verify = verify
         self.timeout = timeout
         self.session.headers['Accept'] = 'application/json'
-        if token:
-            self.session.headers['Authorization'] = 'Bearer ' + token
-        elif user and password:
-            self.session.auth = (user, password)
-        else:
-            raise SystemExit('Missing credentials: set CONFLUENCE_TOKEN or CONFLUENCE_USER + CONFLUENCE_PASSWORD')
+        self.session.headers['Authorization'] = 'Bearer ' + token
 
     def get(self, path_or_url, params=None, stream=False, retries=4):
         url = path_or_url if path_or_url.startswith('http') else self.url + path_or_url
@@ -67,9 +95,10 @@ class Confluence:
             wait = 2 ** (attempt + 1)
             try:
                 response = self.session.get(url, params=params, stream=stream, timeout=self.timeout)
-            except requests.RequestException:
+            except requests.RequestException as e:
                 if attempt == retries:
                     raise
+                log.warning('Connection problem (%s), retrying in %ds...', e.__class__.__name__, wait)
             else:
                 # 429 = rate limiting (DC 7.7+), 5xx = transient server errors
                 if response.status_code != 429 and response.status_code < 500:
@@ -79,6 +108,7 @@ class Confluence:
                     response.raise_for_status()
                 retry_after = response.headers.get('Retry-After', '')
                 wait = int(retry_after) if retry_after.isdigit() else wait
+                log.warning('Server answered HTTP %s, retrying in %ds...', response.status_code, wait)
             time.sleep(wait)
 
     def paged(self, path, params):
@@ -98,9 +128,12 @@ class Confluence:
         try:
             return self.get('/rest/api/space/' + space_key).json()
         except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code in (401, 403, 404):
-                raise SystemExit('Space "%s" does not exist or you have no access to it (HTTP %s)'
-                                 % (space_key, e.response.status_code))
+            code = e.response.status_code if e.response is not None else None
+            if code == 401:
+                raise SystemExit('ERROR: token rejected (HTTP 401) - check CONFLUENCE_TOKEN')
+            if code in (403, 404):
+                raise SystemExit('ERROR: space "%s" does not exist or you have no access to it (HTTP %s)'
+                                 % (space_key, code))
             raise
 
     def space_content(self, space_key, content_type):
@@ -132,7 +165,7 @@ def unique_path(path, used):
         return path
     root, ext = os.path.splitext(path)
     i = 1
-    while '%s (%d)%s' % (root, i, ext) in used:
+    while '%s (%d)%s' % (root, i, ext) in used or os.path.exists('%s (%d)%s' % (root, i, ext)):
         i += 1
     path = '%s (%d)%s' % (root, i, ext)
     used.add(path)
@@ -147,82 +180,122 @@ def download(confluence, url, target):
     os.replace(tmp, target)
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Download all attachments of a Confluence space into a page-tree folder structure.')
-    parser.add_argument('--url', required=True, help='Confluence base URL incl. context path, e.g. https://wiki.example.com/confluence')
-    parser.add_argument('--space', required=True, help='Space key, e.g. DOCS')
-    parser.add_argument('--out', default='.', help='Output directory (default: current directory)')
-    parser.add_argument('--blogposts', action='store_true', help='Also download attachments of blog posts (into _Blog posts/)')
-    parser.add_argument('--skip-existing', action='store_true', help='Skip files that already exist with the same size (resume an interrupted run)')
-    parser.add_argument('--ca-bundle', help='Path to a CA bundle for an internal TLS certificate')
-    parser.add_argument('--insecure', action='store_true', help='Disable TLS verification (not recommended)')
-    args = parser.parse_args()
+def setup_logging(log_file):
+    log.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s  %(levelname)-7s %(message)s', '%H:%M:%S')
+    for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(log_file, encoding='utf-8')):
+        handler.setFormatter(fmt)
+        log.addHandler(handler)
 
-    verify = False if args.insecure else (args.ca_bundle or True)
-    confluence = Confluence(
-        args.url,
-        token=os.environ.get('CONFLUENCE_TOKEN'),
-        user=os.environ.get('CONFLUENCE_USER'),
-        password=os.environ.get('CONFLUENCE_PASSWORD'),
-        verify=verify,
-    )
+
+def parse_args():
+    """Optional command-line overrides of the CONFIGURATION section."""
+    parser = argparse.ArgumentParser(description='Download all attachments of a Confluence space into a page-tree folder structure.')
+    parser.add_argument('--url', default=CONFLUENCE_URL)
+    parser.add_argument('--token', default=os.environ.get('CONFLUENCE_TOKEN') or CONFLUENCE_TOKEN)
+    parser.add_argument('--space', default=SPACE_KEY)
+    parser.add_argument('--out', default=OUTPUT_DIR)
+    parser.add_argument('--blogposts', action='store_true', default=INCLUDE_BLOGPOSTS)
+    parser.add_argument('--no-skip-existing', dest='skip_existing', action='store_false', default=SKIP_EXISTING)
+    parser.add_argument('--ca-bundle', default=VERIFY_SSL if isinstance(VERIFY_SSL, str) else None)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if not args.token or args.token.startswith('PASTE-'):
+        raise SystemExit('ERROR: set CONFLUENCE_TOKEN in the CONFIGURATION section at the top of the script')
+    if 'example.com' in args.url:
+        raise SystemExit('ERROR: set CONFLUENCE_URL in the CONFIGURATION section at the top of the script')
+
+    verify = args.ca_bundle or bool(VERIFY_SSL)
+    confluence = Confluence(args.url, args.token, verify=verify)
 
     space = confluence.check_space(args.space)
     base_dir = os.path.join(args.out, safe_name(space['key']))
     os.makedirs(base_dir, exist_ok=True)
-    print('Space: %s (%s) -> %s' % (space['name'], space['key'], base_dir))
+    setup_logging(os.path.join(base_dir, '_download.log'))
+    started = time.time()
+
+    log.info('Space: %s (%s)', space['name'], space['key'])
+    log.info('Output folder: %s', os.path.abspath(base_dir))
 
     sources = [('page', base_dir)]
     if args.blogposts:
         sources.append(('blogpost', os.path.join(base_dir, '_Blog posts')))
 
-    folder_cache, used_paths = {}, set()
-    stats = {'pages': 0, 'files': 0, 'skipped': 0, 'errors': 0, 'bytes': 0}
-    manifest_path = os.path.join(base_dir, '_attachments_manifest.csv')
+    log.info('Collecting the list of pages...')
+    items = []
+    for content_type, root in sources:
+        for page in confluence.space_content(args.space, content_type):
+            items.append((page, root))
+            if len(items) % 500 == 0:
+                log.info('  ...%d found so far', len(items))
+    log.info('Found %d %s. Starting download.', len(items), 'pages/blog posts' if args.blogposts else 'pages')
 
-    with open(manifest_path, 'w', newline='', encoding='utf-8') as manifest_file:
-        manifest = csv.writer(manifest_file)
+    folder_cache, used_paths = {}, set()
+    stats = {'pages_with_files': 0, 'files': 0, 'skipped': 0, 'errors': 0, 'bytes': 0}
+    manifest_path = os.path.join(base_dir, '_attachments_manifest.csv')
+    width = len(str(len(items)))
+
+    with open(manifest_path, 'w', newline='', encoding='utf-8-sig') as manifest_file:
+        manifest = csv.writer(manifest_file, delimiter=';')
         manifest.writerow(['page_id', 'page_title', 'attachment_id', 'file_name', 'version', 'size', 'local_path', 'status'])
 
-        for content_type, root in sources:
-            for page in confluence.space_content(args.space, content_type):
-                stats['pages'] += 1
-                folder = None
-                for att in confluence.attachments(page['id']):
-                    if folder is None:
-                        folder = page_folder(page, folder_cache, root)
-                        os.makedirs(folder, exist_ok=True)
+        for index, (page, root) in enumerate(items, 1):
+            progress = '[%*d/%d]' % (width, index, len(items))
+            attachments = list(confluence.attachments(page['id']))
+            if not attachments:
+                log.info('%s %s - no attachments', progress, page['title'])
+                continue
 
-                    size = att.get('extensions', {}).get('fileSize')
-                    target = os.path.join(folder, safe_name(att['title'], max_len=200))
-                    status = 'ok'
-                    if args.skip_existing and os.path.exists(target) and size is not None and os.path.getsize(target) == size:
-                        used_paths.add(target)
-                        status = 'skipped'
-                        stats['skipped'] += 1
-                    else:
-                        target = unique_path(target, used_paths)
-                        link = att['_links']['download']
-                        url = link if link.startswith('http') else att['_links'].get('base', confluence.url) + link
-                        try:
-                            download(confluence, url, target)
-                            stats['files'] += 1
-                            stats['bytes'] += os.path.getsize(target)
-                        except Exception as e:  # keep going, report at the end
-                            status = 'error: %s' % e
-                            stats['errors'] += 1
-                            print('  ! %s / %s: %s' % (page['title'], att['title'], e), file=sys.stderr)
+            stats['pages_with_files'] += 1
+            folder = page_folder(page, folder_cache, root)
+            os.makedirs(folder, exist_ok=True)
+            log.info('%s %s - %d attachment(s) -> %s', progress, page['title'], len(attachments),
+                     os.path.relpath(folder, base_dir))
 
-                    manifest.writerow([page['id'], page['title'], att['id'], att['title'],
-                                       att.get('version', {}).get('number'), size,
-                                       os.path.relpath(target, base_dir), status])
-                    print('  %s %s' % ('=' if status == 'skipped' else '+', os.path.relpath(target, base_dir)))
+            for att in attachments:
+                size = att.get('extensions', {}).get('fileSize')
+                target = os.path.join(folder, safe_name(att['title'], max_len=200))
+                if args.skip_existing and os.path.exists(target) and size is not None and os.path.getsize(target) == size:
+                    used_paths.add(target)
+                    status = 'skipped'
+                    stats['skipped'] += 1
+                    log.info('      = %s (already downloaded)', att['title'])
+                else:
+                    target = unique_path(target, used_paths)
+                    link = att['_links']['download']
+                    url = link if link.startswith('http') else att['_links'].get('base', confluence.url) + link
+                    try:
+                        download(confluence, url, target)
+                        status = 'ok'
+                        stats['files'] += 1
+                        stats['bytes'] += os.path.getsize(target)
+                        log.info('      + %s (%s)', att['title'], human_size(os.path.getsize(target)))
+                    except Exception as e:  # keep going, report at the end
+                        status = 'error: %s' % e
+                        stats['errors'] += 1
+                        log.error('      ! %s - %s', att['title'], e)
 
-    print('\nPages scanned: %(pages)d, downloaded: %(files)d files (%(bytes)d bytes), '
-          'skipped: %(skipped)d, errors: %(errors)d' % stats)
-    print('Manifest: %s' % manifest_path)
+                manifest.writerow([page['id'], page['title'], att['id'], att['title'],
+                                   att.get('version', {}).get('number'), size,
+                                   os.path.relpath(target, base_dir), status])
+
+    elapsed = int(time.time() - started)
+    log.info('=' * 60)
+    log.info('DONE in %dm %02ds', elapsed // 60, elapsed % 60)
+    log.info('Pages scanned:        %d (with attachments: %d)', len(items), stats['pages_with_files'])
+    log.info('Files downloaded:     %d (%s)', stats['files'], human_size(stats['bytes']))
+    log.info('Skipped (existing):   %d', stats['skipped'])
+    log.info('Errors:               %d', stats['errors'])
+    log.info('Manifest:             %s', os.path.abspath(manifest_path))
     return 1 if stats['errors'] else 0
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print('\nInterrupted - run again to resume (already downloaded files will be skipped).')
+        sys.exit(130)
